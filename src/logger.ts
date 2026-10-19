@@ -97,9 +97,31 @@ let stderrDead = false;
 // warnReopenFailed() un-mutes so the stderr fallback still works.
 let stderrMuted = false;
 
+// #3857: listeners notified once per VERIFIED open (the stream's 'open' event,
+// i.e. fd in hand). A pending createWriteStream is NOT live yet: #2864's mute
+// decision used to read the pending stream as live and race the async open, so
+// a refused open then killed both legs in silence. Live-leg decisions hang off
+// this hook instead of probing stream state at configureLogger time.
+const fileLegLiveListeners: Array<() => void> = [];
+
 /** #2864: stop writing to stderr (file-only mode). See the state comment. */
 export function muteStderrLeg(): void {
     stderrMuted = true;
+}
+
+/** #3857: register a callback fired once per successful stream open —
+ *  immediately when the leg is already live at registration time. A refused
+ *  open never fires it, so a dependent decision (the #2864 mute) keeps its
+ *  fallback instead of racing the async open. */
+export function onFileLegLive(fn: () => void): void {
+    fileLegLiveListeners.push(fn);
+    if (isFileLoggingActive()) fn();
+}
+
+function fireFileLegLive(): void {
+    for (const fn of [...fileLegLiveListeners]) {
+        try { fn(); } catch { /* a broken listener must never break logging */ }
+    }
 }
 
 const STREAM_WRITE_ERROR_CODES = new Set(["EPIPE", "EIO", "EBADF", "ERR_STREAM_DESTROYED"]);
@@ -172,15 +194,27 @@ function openStream(file: string): WriteStream {
     }
     const s = createWriteStream(file, { flags: "a" });
     s.on("open", (fd: number) => {
-        if (stream === s) streamFd = fd;
+        if (stream === s) {
+            streamFd = fd;
+            // #3857: the degradation episode ends only on a VERIFIED open. The
+            // one-shot reset lives here (not at stream creation) because the
+            // pending→fail→retry loop otherwise re-arms it per doomed stream.
+            reopenWarned = false;
+            fireFileLegLive();
+        }
     });
     // If the stream errors (disk full, perms), drop it so the next write
     // triggers a reopen instead of piling onto a dead stream.
-    s.on("error", () => {
+    s.on("error", (err) => {
         try { s.destroy(); } catch { /* best-effort */ }
         if (stream === s) {
             stream = undefined;
             streamFd = undefined;
+            // #3857: an ASYNC open/write failure reaches only this event —
+            // getStream()'s try/catch sees sync throws (mkdirSync) alone. Warn
+            // here (one-shot + un-mute the stderr fallback) or the whole
+            // degradation is invisible and a muted child loses both legs.
+            warnReopenFailed(err);
         }
     });
     bytesWritten = existingSize;
@@ -237,7 +271,6 @@ function getStream(): WriteStream | undefined {
     streamFd = undefined;
     try {
         stream = openStream(logPath);
-        reopenWarned = false;
         return stream;
     } catch (err) {
         stream = undefined;
@@ -342,8 +375,10 @@ export function getLogPath(): string | undefined {
     return logPath;
 }
 
-/** #2864: true while a usable file stream is open (the stderr-mute decision
- *  must not fire when file logging already degraded to stderr-only). */
+/** #2864/#3857: true only while a file stream is verifiably OPEN (its fd in
+ *  hand). A pending createWriteStream is writable but not usable — the old
+ *  pending-inclusive check let the #2864 mute land before a refused async
+ *  open, killing both legs (#3857). */
 export function isFileLoggingActive(): boolean {
-    return stream !== undefined && stream.writable;
+    return stream !== undefined && stream.writable && streamFd !== undefined;
 }

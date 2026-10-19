@@ -95,7 +95,7 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore } from "./persist.js";
-import { log as loggerLog, configureLogger, getLogPath, closeLogger, isFileLoggingActive, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg } from "./logger.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger, onFileLegLive, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type ProxyInstanceFile, type SameLanePeer } from "./instance.js";
@@ -494,10 +494,14 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // file leg live that pipe is a pure unbounded duplicate of bili.log
     // (31.7MB/5 days observed, other sessions' traces included). Mute it:
     // the port log degrades to a pre-logger crash sink only. Manual starts
-    // (no launch token) keep the terminal tee; a failed file open keeps the
-    // stderr fallback (isFileLoggingActive gate).
-    if (process.env.BILI_LAUNCH_TOKEN?.trim() && isFileLoggingActive()) {
-        muteStderrLeg();
+    // (no launch token) keep the terminal tee. #3857: the mute waits for the
+    // file leg to be VERIFIABLY open (onFileLegLive fires from the stream's
+    // 'open' event) — deciding on the pending stream raced the async open,
+    // and a refused open then killed BOTH legs with no warning. A refused
+    // open never fires the hook: stderr stays live and the one-shot
+    // degradation warn covers the rest.
+    if (process.env.BILI_LAUNCH_TOKEN?.trim()) {
+        onFileLegLive(() => muteStderrLeg());
     }
     const core = createCore();
     const config: Config = opts.kernelConfig;
