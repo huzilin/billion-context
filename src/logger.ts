@@ -43,6 +43,11 @@ import { maskIpsInText, redactSecretsInText } from "./log-mask.js";
 
 const MAX_BYTES = 10 * 1024 * 1024; // 10 MB → rotate
 
+// File-type bits for the open-fd directory check below (POSIX mode constants;
+// Node reports them identically on Windows).
+const S_IFMT = 0o170000;
+const S_IFDIR = 0o040000;
+
 export type Logger = (level: string, msg: string) => void;
 
 // ── Request-scoped session attribution ─────────────────────────────────────
@@ -97,11 +102,12 @@ let stderrDead = false;
 // warnReopenFailed() un-mutes so the stderr fallback still works.
 let stderrMuted = false;
 
-// #3857: listeners notified once per VERIFIED open (the stream's 'open' event,
-// i.e. fd in hand). A pending createWriteStream is NOT live yet: #2864's mute
-// decision used to read the pending stream as live and race the async open, so
-// a refused open then killed both legs in silence. Live-leg decisions hang off
-// this hook instead of probing stream state at configureLogger time.
+// #3857: listeners notified once per VERIFIED open ('open' event AND the fd
+// fstat-verified not to be a directory — see openStream's handler). A pending
+// createWriteStream is NOT live yet: #2864's mute decision used to read the
+// pending stream as live and race the async open, so a refused open then
+// killed both legs in silence. Live-leg decisions hang off this hook instead
+// of probing stream state at configureLogger time.
 const fileLegLiveListeners: Array<() => void> = [];
 
 /** #2864: stop writing to stderr (file-only mode). See the state comment. */
@@ -109,10 +115,11 @@ export function muteStderrLeg(): void {
     stderrMuted = true;
 }
 
-/** #3857: register a callback fired once per successful stream open —
- *  immediately when the leg is already live at registration time. A refused
- *  open never fires it, so a dependent decision (the #2864 mute) keeps its
- *  fallback instead of racing the async open. */
+/** #3857: register a callback fired once per VERIFIED stream open (fd in hand
+ *  AND not a directory fd — Win32 can emit 'open' for an unusable directory
+ *  handle) — immediately when the leg is already live at registration time. A
+ *  refused or unusable open never fires it, so a dependent decision (the
+ *  #2864 mute) keeps its fallback instead of racing the async open. */
 export function onFileLegLive(fn: () => void): void {
     fileLegLiveListeners.push(fn);
     if (isFileLoggingActive()) fn();
@@ -172,6 +179,17 @@ export function setLogCapture(fn: ((level: string, msg: string) => void) | null)
     capture = fn;
 }
 
+/** Drop a freshly-opened stream whose fd failed verification (a directory on
+ *  Win32, or fstat itself failing): clear state so the next line reopens, and
+ *  run the one-shot degradation warn — the async-failure path getStream()'s
+ *  try/catch cannot see (#3857). */
+function rejectOpen(s: WriteStream, err: unknown): void {
+    try { s.destroy(); } catch { /* best-effort */ }
+    stream = undefined;
+    streamFd = undefined;
+    warnReopenFailed(err);
+}
+
 function openStream(file: string): WriteStream {
     mkdirSync(path.dirname(file), { recursive: true });
     // Rotate if oversized.
@@ -194,14 +212,25 @@ function openStream(file: string): WriteStream {
     }
     const s = createWriteStream(file, { flags: "a" });
     s.on("open", (fd: number) => {
-        if (stream === s) {
-            streamFd = fd;
-            // #3857: the degradation episode ends only on a VERIFIED open. The
-            // one-shot reset lives here (not at stream creation) because the
-            // pending→fail→retry loop otherwise re-arms it per doomed stream.
-            reopenWarned = false;
-            fireFileLegLive();
+        if (stream !== s) return;
+        // #3857 (Windows CI evidence): Win32 can hand out an fd for a DIRECTORY
+        // that only fails on the first write — 'open' alone is not proof the
+        // leg is usable. Reject directory fds here so degradation surfaces
+        // immediately (one warn, no liveness hook fire) instead of on the
+        // first lost line. Character devices (/dev/null logFile) stay legal.
+        let st: ReturnType<typeof fstatSync>;
+        try {
+            st = fstatSync(fd);
+        } catch (err) {
+            rejectOpen(s, err);
+            return;
         }
+        if ((st.mode & S_IFMT) === S_IFDIR) {
+            rejectOpen(s, new Error("log path is a directory"));
+            return;
+        }
+        streamFd = fd;
+        fireFileLegLive();
     });
     // If the stream errors (disk full, perms), drop it so the next write
     // triggers a reopen instead of piling onto a dead stream.
@@ -340,7 +369,18 @@ export const log: Logger = (level, msg) => {
         }
         if (s) {
             try {
-                s.write(line);
+                // #3857: the FLUSH callback (not the write accept) proves the
+                // byte reached the fd — a doomed stream happily accepts
+                // buffered writes before its 'error' lands, and accepting must
+                // not re-arm the one-shot (that turns the pending→fail→retry
+                // loop back into a warn-per-line storm). Win32 makes this
+                // concrete: 'open' itself can succeed for a directory handle.
+                // No stream-identity gate: a clean flush on a stream that was
+                // later rotated/closed still proved the leg worked, while a
+                // doomed stream's callback always carries an err.
+                s.write(line, (err) => {
+                    if (!err) reopenWarned = false;
+                });
                 bytesWritten += Buffer.byteLength(line);
             } catch {
                 // write failed (fd gone) — drop the stream; next line reopens.

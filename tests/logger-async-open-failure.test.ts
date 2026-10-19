@@ -86,7 +86,14 @@ test("persistent async failures stay one-shot across the per-line retry loop", a
     setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
     configureLogger(file);
     try {
-        await waitForFileLegLive(); // verified open arms the one-shot counter (fresh episode)
+        await waitForFileLegLive();
+        // Under #3857 v2 semantics a VERIFIED OPEN does not arm the one-shot
+        // counter — a LANDED write does (Win32 can emit 'open' for an unusable
+        // fd). Prove the leg healthy so any earlier episode (test 1's refused
+        // open left the flag armed) is closed before we break the file.
+        log("info", "arm-line");
+        await until(() => fs.statSync(file).size > 0, "armed write flushed");
+        await new Promise((r) => setTimeout(r, 50)); // settle the flush-callback reset
         fs.renameSync(file, file + ".bak"); // legal on Windows even while the fd is open
         fs.mkdirSync(file); // path is now a directory → every reopen fails ASYNC (EISDIR)
         for (let i = 0; i < 5; i++) {
